@@ -1,13 +1,12 @@
+
+from telebot import TeleBot
 import os
-import telebot
-from dotenv import load_dotenv
 
-load_dotenv()
+from handlers import setup_handlers
+
 TOKEN = os.getenv("BOT_TOKEN")
-bot = telebot.TeleBot(TOKEN)
+bot = TeleBot(TOKEN)
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id, "Привіт! Я Stylus Assistant бот.")
+setup_handlers(bot)
 
-bot.polling()
+bot.infinity_polling()
