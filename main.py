@@ -4,30 +4,28 @@ import telebot
 from telebot import types
 
 # ========= ENV =========
-TOKEN = os.getenv("BOT_TOKEN")                        # обов'язково
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0")) # основна супергрупа (теплі проєкти)
-DESIGNERS = json.loads(os.getenv("DESIGNERS", "{}")) # {"Yaryna":"111", ...}
+TOKEN = os.getenv("BOT_TOKEN")
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))       # SDS Projekts (теплі)
+DESIGNERS = json.loads(os.getenv("DESIGNERS", "{}"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 
-# ----- COLD ENV (одна тема Inbox у cold-групі) -----
-COLD_GROUP_ID = int(os.getenv("COLD_GROUP_ID", "0"))     # напр. -1002740678423
-COLD_INBOX_TOPIC = os.getenv("COLD_INBOX_TOPIC")         # "5" (рядок або число)
+# ----- COLD (окрема група + одна тема Inbox) -----
+COLD_GROUP_ID = int(os.getenv("COLD_GROUP_ID", "0"))       # SDS Cold Leads
+COLD_INBOX_TOPIC = os.getenv("COLD_INBOX_TOPIC")           # message_thread_id теми "Cold — Inbox" (строка або число)
 
 if not TOKEN:
     raise RuntimeError("ENV BOT_TOKEN is missing")
 
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
-# ========= STATE (in-memory) =========
-# ТЕПЛІ (основні) треди
-THREADS = {}              # client_name -> {"project":..., "history":[(iso,t)], "profile":..., "designer":..., "topic_id":..., "status":"active|closed", "last_file_sent":...}
-CURRENT_CLIENT = {}       # user_id -> client_name
-PROJECTS_BY_DESIGNER = {} # designer -> ["Client: last message", ...]
-TOPIC_TITLE_CACHE = {}    # title -> topic_id (антидублювання тем)
-
+# ========= STATE =========
+THREADS = {}                 # client -> {...}
+CURRENT_CLIENT = {}          # user_id -> client
+PROJECTS_BY_DESIGNER = {}    # designer -> ["Client: last msg", ...]
+TOPIC_TITLE_CACHE = {}       # title -> topic_id (антидублювання)
 PROFILES = ["Yurii", "Olena"]
 
-# ========= Reply Keyboard (постійне меню) =========
+# ========= UI =========
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🆕 Новий клієнт", "📂 Історія переписки")
@@ -36,7 +34,7 @@ def main_menu():
     kb.row("🔍 Перевірити ціну")
     return kb
 
-# ========= Утиліти (теплий потік) =========
+# ========= Utils (теплі) =========
 def topic_link(group_id, topic_id):
     gid = str(group_id)
     abs_id = gid.replace("-100", "") if gid.startswith("-100") else str(abs(group_id))
@@ -61,34 +59,23 @@ def ensure_topic_for_client(client, project_title=None):
         raise RuntimeError("ENV GROUP_CHAT_ID is missing")
 
     title = client if not project_title else f"{client} · {project_title}"
-
-    # якщо тема з таким заголовком вже створювалась — перевикористовуємо
     if title in TOPIC_TITLE_CACHE:
         info["topic_id"] = TOPIC_TITLE_CACHE[title]
         return info["topic_id"]
 
-    # створення вперше
     topic = bot.create_forum_topic(chat_id=GROUP_CHAT_ID, name=title)
     topic_id = topic.message_thread_id
     info["topic_id"] = topic_id
     TOPIC_TITLE_CACHE[title] = topic_id
 
-    bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=f"🧵 Створено тему для *{client}*.",
-        message_thread_id=topic_id
-    )
+    bot.send_message(GROUP_CHAT_ID, f"🧵 Створено тему для *{client}*.", message_thread_id=topic_id)
     return topic_id
 
 def push_to_topic(client, text):
     info = ensure_client(client)
     if not info.get("topic_id"):
         ensure_topic_for_client(client, info.get("project"))
-    bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=f"✉️ Менеджер:\n\n{text}",
-        message_thread_id=info["topic_id"]
-    )
+    bot.send_message(GROUP_CHAT_ID, f"✉️ Менеджер:\n\n{text}", message_thread_id=info["topic_id"])
 
 def thread_buttons(client):
     kb = types.InlineKeyboardMarkup(row_width=1)
@@ -102,14 +89,14 @@ def thread_buttons(client):
         kb.add(types.InlineKeyboardButton("🧵 Відкрити тему", url=topic_link(GROUP_CHAT_ID, THREADS[client]["topic_id"])))
     return kb
 
-def choose_client_inline(candidates):
+def choose_client_inline(cands):
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for name in candidates:
+    for name in cands:
         kb.add(types.InlineKeyboardButton(f"📌 {name}", callback_data=f"choose_client|{name}"))
     kb.add(types.InlineKeyboardButton("✍️ Ввести вручну", callback_data="enter_client"))
     return kb
 
-# ========= Евристики для теплого потоку =========
+# ========= Heuristics =========
 CLIENT_PATTERNS = [
     r"#client\s*:\s*(?P<name>[A-Za-z][\w\s\-\.&]+)",
     r"client\s*:\s*(?P<name>[A-Za-z][\w\s\-\.&]+)",
@@ -124,8 +111,7 @@ PROJECT_PATTERNS = [
     r"^subject\s*:\s*(?P<title>.+)$"
 ]
 
-def _norm(s):
-    return re.sub(r"\s+", " ", s.strip())
+def _norm(s): return re.sub(r"\s+", " ", s.strip())
 
 def guess_client(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -148,23 +134,21 @@ def guess_project(text):
         return _norm(first)
     return None
 
-# ========= Команди (пріоритет над усіма) =========
+# ========= Commands =========
 @bot.message_handler(commands=['start'])
 def start_cmd(m):
     bot.send_message(m.chat.id, "👋 Бот запущений. Кидай текст клієнта — створю тему і збережу історію.", reply_markup=main_menu())
 
 @bot.message_handler(commands=['health'])
-def health(m):
-    bot.reply_to(m, "✅ alive", reply_markup=main_menu())
+def health(m): bot.reply_to(m, "✅ alive", reply_markup=main_menu())
 
 @bot.message_handler(commands=['whoami'])
-def whoami(m):
-    bot.reply_to(m, f"Your ID: {m.from_user.id}", reply_markup=main_menu())
+def whoami(m): bot.reply_to(m, f"Your ID: {m.from_user.id}", reply_markup=main_menu())
 
 @bot.message_handler(commands=['getchatid'])
-def get_chat_id(m):
-    bot.reply_to(m, f"chat.id = {m.chat.id}", reply_markup=main_menu())
+def get_chat_id(m): bot.reply_to(m, f"chat.id = {m.chat.id}", reply_markup=main_menu())
 
+# Діагностика в групі/темі
 @bot.message_handler(commands=['debug_here'])
 def debug_here(m):
     bot.reply_to(m, f"chat.id={m.chat.id}\nthread_id={m.message_thread_id}")
@@ -181,7 +165,7 @@ def projects_by(m):
     else:
         bot.reply_to(m, f"📭 Немає активних завдань для {name}.", reply_markup=main_menu())
 
-# ========= Меню (теплий) =========
+# ========= Меню (теплі) =========
 @bot.message_handler(func=lambda m: m.text == "🆕 Новий клієнт")
 def new_client_btn(m):
     force = types.ForceReply(input_field_placeholder="Введи ім’я клієнта (наприклад: Acme Inc.)")
@@ -280,11 +264,32 @@ def price_btn(m):
         reply_markup=main_menu()
     )
 
-# ========= ТЕПЛИЙ: будь-який текст → у поточний тред або визначити клієнта =========
+# ========= Гард: ігноруємо ВСІ групові меседжі, крім Cold — Inbox =========
+def in_cold_inbox(msg):
+    if not (COLD_GROUP_ID and COLD_INBOX_TOPIC):
+        return False
+    if msg.chat.id != COLD_GROUP_ID:
+        return False
+    return str(msg.message_thread_id or "") == str(COLD_INBOX_TOPIC)
+
+# ========= COLD: тільки “Cold — Inbox” =========
+@bot.message_handler(func=lambda m: in_cold_inbox(m), content_types=['text'])
+def cold_inbox_handler(m):
+    kb_choose_prof = types.InlineKeyboardMarkup(row_width=2)
+    kb_choose_prof.add(
+        types.InlineKeyboardButton("Yurii", callback_data=f"cold_setprof|Yurii|{m.message_thread_id}"),
+        types.InlineKeyboardButton("Olena", callback_data=f"cold_setprof|Olena|{m.message_thread_id}")
+    )
+    bot.reply_to(m, "Який профіль краще подати на цей лід?", reply_markup=kb_choose_prof)
+
+# ========= ТЕПЛИЙ: текст лише з приватів (і з груп — НІ, окрім cold inbox) =========
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def any_text(m):
-    # Якщо це COLD inbox — НЕ обробляємо тут (є окремий хендлер нижче)
-    if COLD_GROUP_ID and COLD_INBOX_TOPIC and m.chat.id == COLD_GROUP_ID and str(m.message_thread_id or "") == str(COLD_INBOX_TOPIC):
+    # 1) Якщо Cold — Inbox, нічого тут не робимо (обробив попередній хендлер)
+    if in_cold_inbox(m):
+        return
+    # 2) Якщо це будь-яка група/супергрупа — ігноруємо, щоб не лилося в останнього клієнта
+    if m.chat.type in ("group", "supergroup"):
         return
 
     text = m.text or ""
@@ -292,19 +297,16 @@ def any_text(m):
     if current:
         info = ensure_client(current)
         info["history"].append((datetime.utcnow().isoformat(), text))
-
-        # НЕ надсилаємо в тему однословні “імена” типу "Culpan"
-        if len((text or "").strip()) < 3:
+        # короткі/службові — не шлемо в тему
+        if len(text.strip()) < 3:
             kb = thread_buttons(current)
             bot.reply_to(m, f"✅ Тред *{current}* вибрано. Надішли повідомлення клієнта для історії.", reply_markup=kb)
             return
-
         try:
             ensure_topic_for_client(current, info.get("project"))
             push_to_topic(current, text)
         except Exception:
             pass
-
         kb = thread_buttons(current)
         bot.reply_to(m, f"✅ Додано в тред *{current}*.", reply_markup=kb)
         return
@@ -334,23 +336,6 @@ def any_text(m):
         msg = bot.reply_to(m, "Як називається клієнт? (буде створено новий тред)", reply_markup=force)
         bot.register_for_reply(msg, _set_client_name_step)
 
-# ========= COLD: детект у “Cold — Inbox” і вибір профілю (Крок 1) =========
-def in_cold_inbox(msg):
-    if not (COLD_GROUP_ID and COLD_INBOX_TOPIC):
-        return False
-    if msg.chat.id != COLD_GROUP_ID:
-        return False
-    return str(msg.message_thread_id or "") == str(COLD_INBOX_TOPIC)
-
-@bot.message_handler(func=lambda m: in_cold_inbox(m), content_types=['text'])
-def cold_inbox_handler(m):
-    kb_choose_prof = types.InlineKeyboardMarkup(row_width=2)
-    kb_choose_prof.add(
-        types.InlineKeyboardButton("Yurii", callback_data=f"cold_setprof|Yurii|{m.message_thread_id}"),
-        types.InlineKeyboardButton("Olena", callback_data=f"cold_setprof|Olena|{m.message_thread_id}")
-    )
-    bot.reply_to(m, "Який профіль краще подати на цей лід?", reply_markup=kb_choose_prof)
-
 # ========= CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 def cb(q):
@@ -362,10 +347,9 @@ def cb(q):
         client = data[1]
         ensure_client(client)
         CURRENT_CLIENT[q.from_user.id] = client
-        bot.edit_message_text(
-            f"✅ Обрано клієнта: *{client}*. Надішли повідомлення — додам в історію.",
-            q.message.chat.id, q.message.id
-        ); bot.answer_callback_query(q.id); return
+        bot.edit_message_text(f"✅ Обрано клієнта: *{client}*. Надішли повідомлення — додам в історію.",
+                              q.message.chat.id, q.message.id)
+        bot.answer_callback_query(q.id); return
 
     if action == "enter_client":
         msg = bot.send_message(q.message.chat.id, "Введи ім’я клієнта:", reply_markup=types.ForceReply())
@@ -378,7 +362,8 @@ def cb(q):
         if not hist:
             bot.answer_callback_query(q.id, "Історія порожня."); return
         text = "\n\n".join([f"{t}:\n{m}" for t,m in hist])[-4000:]
-        bot.send_message(q.message.chat.id, f"🕓 Історія для *{client}*:\n\n{text}"); bot.answer_callback_query(q.id); return
+        bot.send_message(q.message.chat.id, f"🕓 Історія для *{client}*:\n\n{text}")
+        bot.answer_callback_query(q.id); return
 
     if action == "profile":
         client = data[1]
@@ -397,7 +382,8 @@ def cb(q):
     if action == "to_designer":
         client = data[1]
         if not DESIGNERS:
-            bot.send_message(q.message.chat.id, "DESIGNERS порожній. Додай JSON з іменами та Telegram ID."); bot.answer_callback_query(q.id); return
+            bot.send_message(q.message.chat.id, "DESIGNERS порожній. Додай JSON з іменами та Telegram ID.")
+            bot.answer_callback_query(q.id); return
         kb = types.InlineKeyboardMarkup(row_width=1)
         for name in DESIGNERS.keys():
             kb.add(types.InlineKeyboardButton(name, callback_data=f"send_to|{client}|{name}"))
@@ -434,16 +420,13 @@ def cb(q):
             bot.send_message(q.message.chat.id, f"✅ Тред *{client}* закрито.")
         bot.answer_callback_query(q.id); return
 
-    # ---- COLD (крок 1: лише вибір профілю) ----
+    # ---- COLD (крок 1) ----
     if action == "cold_setprof":
-        # format: cold_setprof|<Profile>|<topic_id>
         _, prof, topic_id = data
-        bot.edit_message_text(
-            f"Профіль обрано: *{prof}*. Далі згенеруємо пітч і перевірку ціни у кроці 2.",
-            q.message.chat.id, q.message.id
-        )
+        bot.edit_message_text(f"Профіль обрано: *{prof}*. Далі згенеруємо пітч і перевірку ціни у кроці 2.",
+                              q.message.chat.id, q.message.id)
         bot.answer_callback_query(q.id); return
 
 # ========= RUN =========
-print("Bot is starting…")
+print(f"Bot is starting… GROUP_CHAT_ID={GROUP_CHAT_ID} COLD_GROUP_ID={COLD_GROUP_ID} COLD_INBOX_TOPIC={COLD_INBOX_TOPIC}")
 bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
