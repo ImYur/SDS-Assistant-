@@ -4,14 +4,14 @@ import telebot
 from telebot import types
 
 # ========= ENV =========
-TOKEN = os.getenv("BOT_TOKEN")                       # обов'язково
+TOKEN = os.getenv("BOT_TOKEN")                        # обов'язково
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0")) # основна супергрупа (теплі проєкти)
 DESIGNERS = json.loads(os.getenv("DESIGNERS", "{}")) # {"Yaryna":"111", ...}
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 
 # ----- COLD ENV (одна тема Inbox у cold-групі) -----
-COLD_GROUP_ID = int(os.getenv("COLD_GROUP_ID", "0"))        # -1002740678423
-COLD_INBOX_TOPIC = os.getenv("COLD_INBOX_TOPIC")            # "5" (рядок або число)
+COLD_GROUP_ID = int(os.getenv("COLD_GROUP_ID", "0"))     # напр. -1002740678423
+COLD_INBOX_TOPIC = os.getenv("COLD_INBOX_TOPIC")         # "5" (рядок або число)
 
 if not TOKEN:
     raise RuntimeError("ENV BOT_TOKEN is missing")
@@ -21,8 +21,9 @@ bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 # ========= STATE (in-memory) =========
 # ТЕПЛІ (основні) треди
 THREADS = {}              # client_name -> {"project":..., "history":[(iso,t)], "profile":..., "designer":..., "topic_id":..., "status":"active|closed", "last_file_sent":...}
-CURRENT_CLIENT = {}       # user_id -> client_name (куди писати наступний текст)
+CURRENT_CLIENT = {}       # user_id -> client_name
 PROJECTS_BY_DESIGNER = {} # designer -> ["Client: last message", ...]
+TOPIC_TITLE_CACHE = {}    # title -> topic_id (антидублювання тем)
 
 PROFILES = ["Yurii", "Olena"]
 
@@ -60,9 +61,17 @@ def ensure_topic_for_client(client, project_title=None):
         raise RuntimeError("ENV GROUP_CHAT_ID is missing")
 
     title = client if not project_title else f"{client} · {project_title}"
+
+    # якщо тема з таким заголовком вже створювалась — перевикористовуємо
+    if title in TOPIC_TITLE_CACHE:
+        info["topic_id"] = TOPIC_TITLE_CACHE[title]
+        return info["topic_id"]
+
+    # створення вперше
     topic = bot.create_forum_topic(chat_id=GROUP_CHAT_ID, name=title)
     topic_id = topic.message_thread_id
     info["topic_id"] = topic_id
+    TOPIC_TITLE_CACHE[title] = topic_id
 
     bot.send_message(
         chat_id=GROUP_CHAT_ID,
@@ -155,6 +164,10 @@ def whoami(m):
 @bot.message_handler(commands=['getchatid'])
 def get_chat_id(m):
     bot.reply_to(m, f"chat.id = {m.chat.id}", reply_markup=main_menu())
+
+@bot.message_handler(commands=['debug_here'])
+def debug_here(m):
+    bot.reply_to(m, f"chat.id={m.chat.id}\nthread_id={m.message_thread_id}")
 
 @bot.message_handler(commands=['projects_by'])
 def projects_by(m):
@@ -270,20 +283,28 @@ def price_btn(m):
 # ========= ТЕПЛИЙ: будь-який текст → у поточний тред або визначити клієнта =========
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def any_text(m):
-    # Якщо це COLD inbox — НЕ обробляємо тут (є окремий хендлер нижче). Перенесено вгору? Тоді видалити перевірку.
+    # Якщо це COLD inbox — НЕ обробляємо тут (є окремий хендлер нижче)
     if COLD_GROUP_ID and COLD_INBOX_TOPIC and m.chat.id == COLD_GROUP_ID and str(m.message_thread_id or "") == str(COLD_INBOX_TOPIC):
-        return  # cold обробляємо іншим хендлером
+        return
 
     text = m.text or ""
     current = CURRENT_CLIENT.get(m.from_user.id)
     if current:
         info = ensure_client(current)
         info["history"].append((datetime.utcnow().isoformat(), text))
+
+        # НЕ надсилаємо в тему однословні “імена” типу "Culpan"
+        if len((text or "").strip()) < 3:
+            kb = thread_buttons(current)
+            bot.reply_to(m, f"✅ Тред *{current}* вибрано. Надішли повідомлення клієнта для історії.", reply_markup=kb)
+            return
+
         try:
             ensure_topic_for_client(current, info.get("project"))
             push_to_topic(current, text)
         except Exception:
             pass
+
         kb = thread_buttons(current)
         bot.reply_to(m, f"✅ Додано в тред *{current}*.", reply_markup=kb)
         return
@@ -313,7 +334,7 @@ def any_text(m):
         msg = bot.reply_to(m, "Як називається клієнт? (буде створено новий тред)", reply_markup=force)
         bot.register_for_reply(msg, _set_client_name_step)
 
-# ========= COLD: детект в “Cold — Inbox” і вибір профілю =========
+# ========= COLD: детект у “Cold — Inbox” і вибір профілю (Крок 1) =========
 def in_cold_inbox(msg):
     if not (COLD_GROUP_ID and COLD_INBOX_TOPIC):
         return False
@@ -323,7 +344,6 @@ def in_cold_inbox(msg):
 
 @bot.message_handler(func=lambda m: in_cold_inbox(m), content_types=['text'])
 def cold_inbox_handler(m):
-    # КРОК 1: тільки вибір профілю (без оцінки/пітчу — додамо у кроці 2)
     kb_choose_prof = types.InlineKeyboardMarkup(row_width=2)
     kb_choose_prof.add(
         types.InlineKeyboardButton("Yurii", callback_data=f"cold_setprof|Yurii|{m.message_thread_id}"),
