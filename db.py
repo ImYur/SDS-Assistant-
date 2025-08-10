@@ -1,5 +1,5 @@
 # db.py
-import sqlite3, os, json, time
+import sqlite3, os
 from datetime import datetime
 
 DB_PATH = os.getenv("DB_PATH", "sds.sqlite3")
@@ -11,13 +11,12 @@ CREATE TABLE IF NOT EXISTS clients (
   name TEXT,
   company TEXT,
   profile TEXT,              -- 'Yurii'|'Olena'|NULL
-  designer TEXT,             -- designer name (key from DESIGNERS) or NULL
+  designer TEXT,             -- designer key from DESIGNERS or NULL
   status TEXT DEFAULT 'active', -- 'active'|'closed'|'cold'
-  topic_id INTEGER,          -- forum thread id in group for warm
+  topic_id INTEGER,          -- forum thread id for warm
   created_at TEXT,
   updated_at TEXT
 );
-
 CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_topic ON clients(topic_id);
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -74,8 +73,7 @@ def get_client_by_name(name):
     return cur.fetchone()
 
 def set_client_topic(client_id, topic_id):
-    CONN.execute("UPDATE clients SET topic_id=?, updated_at=? WHERE id=?", (topic_id, now(), client_id))
-    CONN.commit()
+    CONN.execute("UPDATE clients SET topic_id=?, updated_at=? WHERE id=?", (topic_id, now(), client_id)); CONN.commit()
 
 def set_client_profile(client_id, profile):
     CONN.execute("UPDATE clients SET profile=?, updated_at=? WHERE id=?", (profile, now(), client_id)); CONN.commit()
@@ -126,7 +124,6 @@ def cold_kb_snapshot():
 
 # ---- kb for assistant ----
 def kb_snapshot():
-    # маленький зріз знань для AI Assistant
     cur = CONN.cursor()
     cur.execute("SELECT id,name,profile,designer,status,topic_id FROM clients ORDER BY updated_at DESC LIMIT 200")
     clients = cur.fetchall()
