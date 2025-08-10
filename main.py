@@ -1,4 +1,4 @@
-import os, re, json
+import os, json
 from datetime import datetime, timedelta
 import telebot
 from telebot import types
@@ -18,7 +18,6 @@ if not TOKEN or not GROUP_CHAT_ID:
     raise RuntimeError("Missing BOT_TOKEN or GROUP_CHAT_ID")
 
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
-
 SYSTEM_MAP = {"Yurii": prompts.YURII_SYSTEM, "Olena": prompts.OLENA_SYSTEM}
 PROFILES = ["Yurii", "Olena"]
 
@@ -35,20 +34,24 @@ def topic_link(topic_id):
 
 # ===== Меню у приваті =====
 def main_menu():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, input_field_placeholder="Choose…")
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🆕 New client", "📂 History")
     kb.row("🧵 Open topic", "🧑‍🎨 Send to designer")
     kb.row("📋 Active", "✅ Close project")
     kb.row("🔍 Price grid")
     return kb
 
-def ensure_menu_private(m):
-    if m.chat.type == "private":
-        try:
-            bot.send_message(m.chat.id, "Menu:", reply_markup=main_menu())
-        except: pass
+def show_menu(chat_id):
+    try:
+        bot.send_message(chat_id, "Menu:", reply_markup=main_menu())
+    except Exception:
+        pass
 
-# ===== Хелпери warm =====
+# ===== Де ми знаходимось =====
+def in_cold(m): return m.chat.id==GROUP_CHAT_ID and getattr(m,'message_thread_id',None)==COLD_INBOX_TOPIC
+def in_assistant(m): return m.chat.id==GROUP_CHAT_ID and getattr(m,'message_thread_id',None)==ASSISTANT_TOPIC
+
+# ===== Кнопки Warm =====
 def choose_designer_kb(client_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     for name in DESIGNERS.keys():
@@ -72,89 +75,114 @@ def warm_action_kb(client_id):
 def start_cmd(m):
     bot.send_message(m.chat.id, "✅ SDS Assistant ready. Use the menu or send text.", reply_markup=main_menu())
 
+@bot.message_handler(commands=['menu'])
+def menu_cmd(m): show_menu(m.chat.id)
+
 @bot.message_handler(commands=['whoami'])
-def whoami(m): bot.reply_to(m, f"ID: {m.from_user.id}", reply_markup=main_menu())
+def whoami(m):
+    bot.reply_to(m, f"ID: {m.from_user.id}")
+    show_menu(m.chat.id)
 
 @bot.message_handler(commands=['debug_here'])
 def debug_here(m):
     bot.send_message(m.chat.id, f"chat.id={m.chat.id}\nthread_id={getattr(m,'message_thread_id',None)}", parse_mode=None)
+    if m.chat.type == "private":
+        show_menu(m.chat.id)
 
 # ======== COLD INBOX (в тій же групі) ========
-def in_cold(m): return m.chat.id==GROUP_CHAT_ID and getattr(m,'message_thread_id',None)==COLD_INBOX_TOPIC
-def in_assistant(m): return m.chat.id==GROUP_CHAT_ID and getattr(m,'message_thread_id',None)==ASSISTANT_TOPIC
-
 @bot.message_handler(func=lambda m: in_cold(m), content_types=['text'])
 def cold_handler(m):
     text = m.text or ""
     db.add_cold(m.message_id, text)
-    # вибір профілю
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("Yurii", callback_data=f"cold_prof|{m.message_id}|Yurii"),
         types.InlineKeyboardButton("Olena", callback_data=f"cold_prof|{m.message_id}|Olena"),
     )
-    bot.reply_to(m, "Cold lead captured. Choose a profile:", reply_markup=kb)
+    bot.send_message(
+        chat_id=m.chat.id,
+        text="Cold lead captured. Choose a profile:",
+        reply_markup=kb,
+        message_thread_id=m.message_thread_id
+    )
 
 @bot.callback_query_handler(func=lambda q: q.data.startswith("cold_prof|"))
 def cold_choose_profile(q):
     _, msg_id, prof = q.data.split("|")
     msg_id = int(msg_id)
     db.set_cold_profile(msg_id, prof)
-    # тягнемо текст cold
-    kb_text = db.cold_kb_snapshot()
-    # знайдемо оригінальний текст через snapshot не треба; простіше попросимо користувача натиснути «Generate pitch»
+
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("📝 Generate pitch", callback_data=f"cold_pitch|{msg_id}|{prof}"))
     kb.add(types.InlineKeyboardButton("🧵 Convert to Warm", callback_data=f"cold_convert|{msg_id}|{prof}"))
-    bot.edit_message_text(f"Profile set: {prof}. Next: generate pitch or convert to warm.", q.message.chat.id, q.message.id)
-    bot.send_message(q.message.chat.id, "Actions:", reply_markup=kb)
+
+    bot.edit_message_text(
+        chat_id=q.message.chat.id,
+        message_id=q.message.id,
+        text=f"Profile set: {prof}. Next: generate pitch or convert to warm."
+    )
+    bot.send_message(
+        chat_id=q.message.chat.id,
+        text="Actions:",
+        reply_markup=kb,
+        message_thread_id=getattr(q.message, 'message_thread_id', None)
+    )
     bot.answer_callback_query(q.id)
 
 @bot.callback_query_handler(func=lambda q: q.data.startswith("cold_pitch|"))
 def cold_make_pitch(q):
     _, msg_id, prof = q.data.split("|")
     msg_id = int(msg_id)
-    # витягнемо сам текст з БД
-    cur = db.CONN.cursor()
-    cur.execute("SELECT text FROM cold_leads WHERE message_id=?", (msg_id,))
-    row = cur.fetchone()
+    row = db.CONN.execute("SELECT text FROM cold_leads WHERE message_id=?", (msg_id,)).fetchone()
     job_text = row[0] if row else ""
     pitch = ai.gen_pitch(prof, job_text, SYSTEM_MAP)
     db.set_cold_status(msg_id, "archived")
-    bot.edit_message_text("Pitch generated below 👇", q.message.chat.id, q.message.id)
-    bot.send_message(q.message.chat.id, md2_escape(pitch), parse_mode="MarkdownV2")
+
+    bot.edit_message_text(
+        chat_id=q.message.chat.id,
+        message_id=q.message.id,
+        text="Pitch generated below 👇"
+    )
+    bot.send_message(
+        chat_id=q.message.chat.id,
+        text=md2_escape(pitch),
+        parse_mode="MarkdownV2",
+        message_thread_id=getattr(q.message, 'message_thread_id', None)
+    )
     bot.answer_callback_query(q.id)
 
 @bot.callback_query_handler(func=lambda q: q.data.startswith("cold_convert|"))
 def cold_convert(q):
     _, msg_id, prof = q.data.split("|")
     msg_id = int(msg_id)
-    # Спробуємо вгадати ім'я клієнта з перших рядків
-    cur = db.CONN.cursor()
-    cur.execute("SELECT text FROM cold_leads WHERE message_id=?", (msg_id,))
-    row = cur.fetchone()
+    row = db.CONN.execute("SELECT text FROM cold_leads WHERE message_id=?", (msg_id,)).fetchone()
     text = row[0] if row else ""
     name_guess = None
     for line in text.splitlines():
-        if 2<=len(line)<=50:
+        if 2 <= len(line) <= 50:
             name_guess = line.strip()
             break
-    if not name_guess: name_guess = f"Lead {msg_id}"
-    # створюємо warm‑клієнта без топіка — тема створиться нижче
+    if not name_guess:
+        name_guess = f"Lead {msg_id}"
+
     client_id = db.create_client(name_guess, profile=prof, status="active")
-    # створюємо форум‑тему
     topic = bot.create_forum_topic(chat_id=GROUP_CHAT_ID, name=name_guess)
     tid = topic.message_thread_id
     db.set_client_topic(client_id, tid)
     db.set_cold_status(msg_id, "converted")
+
     link = topic_link(tid)
-    bot.edit_message_text(f"✅ Converted to warm: {name_guess}\n{link}", q.message.chat.id, q.message.id, disable_web_page_preview=True)
+    bot.edit_message_text(
+        chat_id=q.message.chat.id,
+        message_id=q.message.id,
+        text=f"✅ Converted to warm: {name_guess}\n{link}",
+        disable_web_page_preview=True
+    )
     bot.answer_callback_query(q.id)
 
 # ======== CHATGPT ASSISTANT ТЕМА ========
 @bot.message_handler(func=lambda m: in_assistant(m), content_types=['text'])
 def assistant_handler(m):
-    # невеличкий KB snapshot
     kb_text = db.kb_snapshot()
     question = m.text or ""
     answer = ai.assistant_answer(kb_text, question)
@@ -166,17 +194,14 @@ def warm_thread_msg(m):
     tid = m.message_thread_id
     row = db.get_client_by_topic(tid)
     if not row:
-        # якщо клієнт не зареєстрований — створимо
-        name = m.chat.title if not m.text else (m.text.splitlines()[0][:32] or "Client")
+        name = f"Client {tid}"
         cid = db.create_client(name, topic_id=tid, status="active")
         row = db.get_client_by_topic(tid)
 
     client_id,name,company,profile,designer,status,topic_id = row
     text = m.text or ""
-    # додаємо до історії як "user" (від клієнта/менеджера)
     db.add_msg(client_id, "user", text)
 
-    # якщо профіль ще не обраний — попросимо
     if not profile:
         kb = types.InlineKeyboardMarkup(row_width=2)
         for p in PROFILES:
@@ -184,12 +209,10 @@ def warm_thread_msg(m):
         bot.reply_to(m, "Choose an account profile for AI replies:", reply_markup=kb)
         return
 
-    # зібрати коротку історію для AI
     hist = db.get_history_messages(client_id, last_n=20)
     reply = ai.gen_reply(profile, hist, SYSTEM_MAP)
     db.add_msg(client_id, "assistant", reply)
 
-    # показати дії
     bot.send_message(GROUP_CHAT_ID, f"🤖 Suggested reply:\n\n{md2_escape(reply)}", message_thread_id=tid, parse_mode="MarkdownV2", reply_markup=warm_action_kb(client_id))
 
 @bot.callback_query_handler(func=lambda q: q.data.startswith("set_profile|"))
@@ -204,10 +227,9 @@ def send_client(q):
     _, cid = q.data.split("|")
     cid = int(cid)
     row = db.CONN.execute("SELECT topic_id FROM clients WHERE id=?", (cid,)).fetchone()
-    if not row: 
+    if not row:
         bot.answer_callback_query(q.id, "No topic"); return
     tid = row[0]
-    # знайдемо останнє ai‑повідомлення
     last_ai = db.CONN.execute("SELECT content FROM messages WHERE client_id=? AND role='assistant' ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
     if not last_ai:
         bot.answer_callback_query(q.id, "No AI draft"); return
@@ -220,7 +242,6 @@ def ask_designer(q):
     cid = int(cid)
     row = db.CONN.execute("SELECT designer FROM clients WHERE id=?", (cid,)).fetchone()
     if row and row[0]:
-        # вже є дизайнер → відправимо останні нові дані
         send_brief_to_designer(cid, row[0], q)
     else:
         bot.edit_message_text("Choose designer:", q.message.chat.id, q.message.id, reply_markup=choose_designer_kb(cid))
@@ -239,7 +260,6 @@ def send_brief_to_designer(cid, designer_name, q):
     msgs = db.CONN.execute("SELECT role,content FROM messages WHERE client_id=? ORDER BY id DESC LIMIT 8", (cid,)).fetchall()
     if not chat_id:
         bot.answer_callback_query(q.id, f"No Telegram ID for {designer_name}"); return
-    # коротке ТЗ українською
     title = row[0]; prof=row[1]; tid=row[2]
     body = "\n".join([f"{r}: {c}" for r,c in msgs[::-1]])
     brief = f"Клієнт: {title}\nПрофіль: {prof}\nТред: {topic_link(tid)}\n\nОстанні оновлення:\n{body}"
@@ -253,8 +273,9 @@ def close_flow(q):
     _, cid = q.data.split("|"); cid=int(cid)
     row = db.CONN.execute("SELECT name,profile,topic_id FROM clients WHERE id=?", (cid,)).fetchone()
     name, prof, tid = row
-    # контекст для подяки
-    summary = f"Client: {name}\nRecent: {db.CONN.execute('SELECT content FROM messages WHERE client_id=? ORDER BY id DESC LIMIT 1',(cid,)).fetchone()[0]}"
+    last = db.CONN.execute("SELECT content FROM messages WHERE client_id=? ORDER BY id DESC LIMIT 1",(cid,)).fetchone()
+    recent = last[0] if last else ""
+    summary = f"Client: {name}\nRecent: {recent}"
     thanks = ai.gen_thanks(prof or "Yurii", summary, SYSTEM_MAP)
     kb = types.InlineKeyboardMarkup()
     kb.add(
@@ -288,7 +309,7 @@ def close_archive(q):
     bot.edit_message_text("✅ Archived. Thread removed.", q.message.chat.id, q.message.id)
     bot.answer_callback_query(q.id)
 
-# ======== Приват: меню‑кнопки ========
+# ======== Приват: меню-кнопки ========
 @bot.message_handler(func=lambda m: m.chat.type=="private" and m.text=="🔍 Price grid")
 def price_grid(m):
     bot.reply_to(m,
@@ -303,8 +324,9 @@ def price_grid(m):
 
 @bot.message_handler(func=lambda m: m.chat.type=="private", content_types=['text'])
 def private_any(m):
-    # постійно показуємо меню
-    ensure_menu_private(m)
+    if m.text and m.text.strip().startswith("/"):
+        return
+    show_menu(m.chat.id)
 
 print("Bot is starting…")
 bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
