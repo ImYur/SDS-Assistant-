@@ -5,25 +5,29 @@ from telebot import types
 
 # ========= ENV =========
 TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))        # SDS Projekts (теплі)
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))        # ОДНА супергрупа (і “cold”, і “теплі”)
 DESIGNERS = json.loads(os.getenv("DESIGNERS", "{}"))        # {"Yaryna":"111", ...}
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 
-# ----- COLD (окрема група + одна тема Inbox) -----
-COLD_GROUP_ID = int(os.getenv("COLD_GROUP_ID", "0"))        # SDS Cold Leads
-COLD_INBOX_TOPIC = os.getenv("COLD_INBOX_TOPIC")            # "5" (id треду як рядок/цифра)
+# Тред “Cold — Inbox” у ТІЙ ЖЕ групі
+COLD_INBOX_TOPIC = os.getenv("COLD_INBOX_TOPIC")            # наприклад: "5" (id треду)
 
 if not TOKEN:
     raise RuntimeError("ENV BOT_TOKEN is missing")
+if not GROUP_CHAT_ID:
+    raise RuntimeError("ENV GROUP_CHAT_ID is missing")
 
-bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")  # загальний режим; для сирого тексту вказуватимемо parse_mode=None
+bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")  # загальний режим
 
 # ========= STATE =========
-THREADS = {}                 # client -> {project, history, profile, designer, topic_id, status, last_file_sent}
-CURRENT_CLIENT = {}          # user_id -> client
-PROJECTS_BY_DESIGNER = {}    # designer -> ["Client: last msg", ...]
-TOPIC_TITLE_CACHE = {}       # title -> topic_id (антидубль)
+THREADS = {}               # warm: client -> {...}
+CURRENT_CLIENT = {}        # user_id -> client
+PROJECTS_BY_DESIGNER = {}  # designer -> [...]
+TOPIC_TITLE_CACHE = {}     # title -> topic_id
 PROFILES = ["Yurii", "Olena"]
+
+# cold inbox (в одній групі)
+LEADS = {}                 # lead_id(=message_id) -> {"client","text","profile","status","created_ts"}
 
 # ========= HELPERS =========
 def main_menu():
@@ -38,6 +42,13 @@ def topic_link(group_id, topic_id):
     gid = str(group_id)
     abs_id = gid.replace("-100", "") if gid.startswith("-100") else str(abs(group_id))
     return f"https://t.me/c/{abs_id}/{topic_id}"
+
+def md2_escape(s: str) -> str:
+    if s is None: return ""
+    s = s.replace("\\", "\\\\")
+    for ch in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']:
+        s = s.replace(ch, '\\' + ch)
+    return s
 
 def ensure_client(client):
     return THREADS.setdefault(client, {
@@ -54,8 +65,6 @@ def ensure_topic_for_client(client, project_title=None):
     info = ensure_client(client)
     if info.get("topic_id"):
         return info["topic_id"]
-    if not GROUP_CHAT_ID:
-        raise RuntimeError("ENV GROUP_CHAT_ID is missing")
 
     title = client if not project_title else f"{client} · {project_title}"
     if title in TOPIC_TITLE_CACHE:
@@ -63,26 +72,18 @@ def ensure_topic_for_client(client, project_title=None):
         return info["topic_id"]
 
     topic = bot.create_forum_topic(chat_id=GROUP_CHAT_ID, name=title)
-    topic_id = topic.message_thread_id
-    info["topic_id"] = topic_id
-    TOPIC_TITLE_CACHE[title] = topic_id
-    bot.send_message(GROUP_CHAT_ID, f"🧵 Створено тему для *{client}*.", message_thread_id=topic_id)
-    return topic_id
-
-def md2_escape(s: str) -> str:
-    if s is None:
-        return ""
-    s = s.replace("\\", "\\\\")
-    for ch in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']:
-        s = s.replace(ch, '\\' + ch)
-    return s
+    tid = topic.message_thread_id
+    info["topic_id"] = tid
+    TOPIC_TITLE_CACHE[title] = tid
+    bot.send_message(GROUP_CHAT_ID, f"🧵 Створено тему для *{md2_escape(client)}*.", message_thread_id=tid, parse_mode="MarkdownV2")
+    return tid
 
 def push_to_topic(client, text):
     info = ensure_client(client)
     if not info.get("topic_id"):
         ensure_topic_for_client(client, info.get("project"))
     safe = md2_escape(text)
-    bot.send_message(GROUP_CHAT_ID, f"✉️ Менеджер:\n\n{saf e}", message_thread_id=info["topic_id"], parse_mode="MarkdownV2")
+    bot.send_message(GROUP_CHAT_ID, f"✉️ Менеджер:\n\n{safe}", message_thread_id=info["topic_id"], parse_mode="MarkdownV2")
 
 def thread_buttons(client):
     kb = types.InlineKeyboardMarkup(row_width=1)
@@ -141,6 +142,9 @@ def guess_project(text):
         return _norm(first)
     return None
 
+def in_cold_inbox(msg):
+    return (str(msg.chat.id) == str(GROUP_CHAT_ID)) and (str(msg.message_thread_id or "") == str(COLD_INBOX_TOPIC))
+
 # ========= Commands =========
 @bot.message_handler(commands=['start'])
 def start_cmd(m):
@@ -155,11 +159,11 @@ def whoami(m): bot.reply_to(m, f"Your ID: {m.from_user.id}", reply_markup=main_m
 @bot.message_handler(commands=['getchatid'])
 def get_chat_id(m): bot.reply_to(m, f"chat.id = {m.chat.id}", reply_markup=main_menu())
 
-# ВАЖЛИВО: без Markdown, щоб `_` не ламався
+# без Markdown, щоб не ламався _
 @bot.message_handler(commands=['debug_here'])
 def debug_here(m):
-    text = f"chat.id={m.chat.id}\nthread_id={getattr(m, 'message_thread_id', None)}\nfrom_user={m.from_user.id}"
-    bot.send_message(m.chat.id, text, parse_mode=None)
+    txt = f"chat.id={m.chat.id}\nthread_id={getattr(m,'message_thread_id',None)}\nfrom_user={m.from_user.id}"
+    bot.send_message(m.chat.id, txt, parse_mode=None)
 
 @bot.message_handler(commands=['projects_by'])
 def projects_by(m):
@@ -173,128 +177,33 @@ def projects_by(m):
     else:
         bot.reply_to(m, f"📭 Немає активних завдань для {name}.", reply_markup=main_menu())
 
-# ========= Меню (теплі) =========
-@bot.message_handler(func=lambda m: m.text == "🆕 Новий клієнт")
-def new_client_btn(m):
-    force = types.ForceReply(input_field_placeholder="Введи ім’я клієнта (наприклад: Acme Inc.)")
-    msg = bot.reply_to(m, "Як називається клієнт? (створю тему та тред)", reply_markup=force)
-    bot.register_for_reply(msg, _set_client_name_step)
-
-def _set_client_name_step(reply_msg):
-    name = (reply_msg.text or "").strip()
-    if not name:
-        bot.reply_to(reply_msg, "Порожнє ім’я. Спробуй ще раз.", reply_markup=main_menu()); return
-    ensure_client(name)
-    CURRENT_CLIENT[reply_msg.from_user.id] = name
-    try:
-        topic_id = ensure_topic_for_client(name, THREADS[name].get("project"))
-        link = topic_link(GROUP_CHAT_ID, topic_id)
-        kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🧵 Відкрити тему", url=link))
-        bot.reply_to(reply_msg, f"🆕 Створив клієнта *{name}*. Надішли повідомлення клієнта — додам у тред.", reply_markup=main_menu())
-        bot.send_message(reply_msg.chat.id, "Швидкий перехід:", reply_markup=kb)
-    except Exception as e:
-        bot.reply_to(reply_msg, f"⚠️ Не вдалось створити тему (GROUP_CHAT_ID?): {e}", reply_markup=main_menu())
-
-@bot.message_handler(func=lambda m: m.text == "📂 Історія переписки")
-def history_btn(m):
-    if not THREADS:
-        bot.reply_to(m, "Поки що немає жодного клієнта.", reply_markup=main_menu()); return
-    names = sorted(THREADS.keys())
-    bot.reply_to(m, "Вибери клієнта:", reply_markup=choose_client_inline(names))
-
-@bot.message_handler(func=lambda m: m.text == "🧵 Відкрити тему")
-def open_topic_btn(m):
-    client = CURRENT_CLIENT.get(m.from_user.id)
-    if not client:
-        bot.reply_to(m, "Спершу обери/створи клієнта (кнопка “🆕 Новий клієнт”).", reply_markup=main_menu()); return
-    info = ensure_client(client)
-    try:
-        tid = ensure_topic_for_client(client, info.get("project"))
-        link = topic_link(GROUP_CHAT_ID, tid)
-        bot.send_message(m.chat.id, "Ось тема:", reply_markup=types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("🧵 Перейти", url=link)
-        ))
-    except Exception as e:
-        bot.reply_to(m, f"⚠️ Не вдалось відкрити тему: {e}", reply_markup=main_menu())
-
-@bot.message_handler(func=lambda m: m.text == "🧑‍🎨 Відправити дизайнеру")
-def send_designer_btn(m):
-    if not THREADS:
-        bot.reply_to(m, "Немає тредів. Спочатку створіть клієнта.", reply_markup=main_menu()); return
-    client = CURRENT_CLIENT.get(m.from_user.id)
-    if not client:
-        names = sorted(THREADS.keys())
-        bot.reply_to(m, "Обери клієнта:", reply_markup=choose_client_inline(names)); return
-    if not DESIGNERS:
-        bot.reply_to(m, "ENV DESIGNERS порожній. Додай JSON з іменами та Telegram ID.", reply_markup=main_menu()); return
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for d in DESIGNERS.keys():
-        kb.add(types.InlineKeyboardButton(d, callback_data=f"send_to|{client}|{d}"))
-    bot.reply_to(m, f"Кому надіслати тред *{client}*?", reply_markup=kb)
-
-@bot.message_handler(func=lambda m: m.text == "📋 Активні клієнти")
-def active_btn(m):
-    act = [n for n,t in THREADS.items() if t.get("status")!="closed"]
-    if not act:
-        bot.reply_to(m, "Активних немає.", reply_markup=main_menu()); return
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for n in act:
-        tid = THREADS[n].get("topic_id")
-        if tid:
-            kb.add(types.InlineKeyboardButton(f"🧵 {n}", url=topic_link(GROUP_CHAT_ID, tid)))
-        else:
-            kb.add(types.InlineKeyboardButton(f"🧵 {n} (створити тему)", callback_data=f"mk_topic|{n}"))
-    bot.reply_to(m, "Активні клієнти:", reply_markup=kb)
-
-@bot.message_handler(func=lambda m: m.text == "✅ Завершити проєкт")
-def close_btn(m):
-    if not THREADS:
-        bot.reply_to(m, "Немає активних тредів.", reply_markup=main_menu()); return
-    names = [n for n,t in THREADS.items() if t.get("status")!="closed"]
-    if not names:
-        bot.reply_to(m, "Усі вже закриті.", reply_markup=main_menu()); return
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for n in names:
-        kb.add(types.InlineKeyboardButton(f"✅ Закрити: {n}", callback_data=f"close|{n}"))
-    bot.reply_to(m, "Оберіть тред для закриття:", reply_markup=kb)
-
-@bot.message_handler(func=lambda m: m.text == "🔍 Перевірити ціну")
-def price_btn(m):
-    bot.reply_to(
-        m,
-        "Швидка сітка:\n"
-        "• Logo “Clean Start” — $100\n"
-        "• Brand Essentials — $220\n"
-        "• Ready to Launch — $360\n"
-        "• Complete Look — $520\n"
-        "• Identity in Action — $1000\n"
-        "• Signature System — $1500+",
-        reply_markup=main_menu()
-    )
-
-# ========= Guards =========
-def in_cold_inbox(msg):
-    if not (COLD_GROUP_ID and COLD_INBOX_TOPIC):
-        return False
-    if msg.chat.id != COLD_GROUP_ID:
-        return False
-    return str(msg.message_thread_id or "") == str(COLD_INBOX_TOPIC)
-
-# ========= COLD =========
+# ========= COLD (в одній групі, тема “Cold — Inbox”) =========
 @bot.message_handler(func=lambda m: in_cold_inbox(m), content_types=['text'])
-def cold_inbox_handler(m):
-    kb_choose_prof = types.InlineKeyboardMarkup(row_width=2)
-    kb_choose_prof.add(
-        types.InlineKeyboardButton("Yurii", callback_data=f"cold_setprof|Yurii|{m.message_thread_id}"),
-        types.InlineKeyboardButton("Olena", callback_data=f"cold_setprof|Olena|{m.message_thread_id}")
-    )
-    bot.reply_to(m, "Який профіль краще подати на цей лід?", reply_markup=kb_choose_prof)
+def cold_inbox(m):
+    text = m.text or ""
+    # дозволимо тригер по хештегу #cold або будь-який текст у цій темі
+    if "#cold" in text.lower() or True:
+        lead_id = m.message_id
+        client = guess_client(text) or "(без імені)"
+        LEADS[lead_id] = {
+            "client": client,
+            "text": text,
+            "profile": None,
+            "status": "new",
+            "created_ts": datetime.utcnow().isoformat(),
+        }
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("Yurii", callback_data=f"cold_setprof|{lead_id}|Yurii"),
+            types.InlineKeyboardButton("Olena", callback_data=f"cold_setprof|{lead_id}|Olena"),
+        )
+        kb.add(types.InlineKeyboardButton("🧵 Створити проєкт‑тред", callback_data=f"cold_convert|{lead_id}"))
+        bot.reply_to(m, f"📌 Лід збережено (id={lead_id}). Клієнт: *{md2_escape(client)}*.\nВибери профіль та/або створи тред.", reply_markup=kb, parse_mode="MarkdownV2")
 
-# ========= WARM (приват) =========
+# ========= WARM (приватні чати із менеджером) =========
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def any_text(m):
-    if in_cold_inbox(m):
-        return
+    # у групі обробляємо лише Cold — Inbox; інші групові ігноруємо
     if m.chat.type in ("group", "supergroup"):
         return
 
@@ -304,16 +213,14 @@ def any_text(m):
         info = ensure_client(current)
         info["history"].append((datetime.utcnow().isoformat(), text))
         if len(text.strip()) < 3:
-            kb = thread_buttons(current)
-            bot.reply_to(m, f"✅ Тред *{current}* вибрано. Надішли повідомлення клієнта для історії.", reply_markup=kb)
+            bot.reply_to(m, f"✅ Тред *{current}* вибрано. Кинь повідомлення клієнта.", reply_markup=thread_buttons(current))
             return
         try:
             ensure_topic_for_client(current, info.get("project"))
             push_to_topic(current, text)
         except Exception:
             pass
-        kb = thread_buttons(current)
-        bot.reply_to(m, f"✅ Додано в тред *{current}*.", reply_markup=kb)
+        bot.reply_to(m, f"✅ Додано в тред *{current}*.", reply_markup=thread_buttons(current))
         return
 
     client = guess_client(text)
@@ -326,9 +233,9 @@ def any_text(m):
         try:
             tid = ensure_topic_for_client(client, info.get("project"))
             link = topic_link(GROUP_CHAT_ID, tid)
-            kb_open = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🧵 Відкрити тему", url=link))
+            kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🧵 Відкрити тему", url=link))
             bot.reply_to(m, f"✅ Створив/оновив тред *{client}*.", reply_markup=main_menu())
-            bot.send_message(m.chat.id, "Швидкий перехід:", reply_markup=kb_open)
+            bot.send_message(m.chat.id, "Швидкий перехід:", reply_markup=kb)
         except Exception:
             bot.reply_to(m, f"✅ Збережено в тред *{client}*.", reply_markup=thread_buttons(client))
         return
@@ -337,9 +244,23 @@ def any_text(m):
     if existing:
         bot.reply_to(m, "Не розпізнав клієнта. Обери зі списку або введи вручну:", reply_markup=choose_client_inline(existing))
     else:
-        force = types.ForceReply(input_field_placeholder="Введи ім’я клієнта (наприклад: Acme Inc.)")
-        msg = bot.reply_to(m, "Як називається клієнт? (буде створено новий тред)", reply_markup=force)
+        msg = bot.reply_to(m, "Як називається клієнт? (буде створено новий тред)", reply_markup=types.ForceReply())
         bot.register_for_reply(msg, _set_client_name_step)
+
+def _set_client_name_step(reply_msg):
+    name = (reply_msg.text or "").strip()
+    if not name:
+        bot.reply_to(reply_msg, "Порожнє ім’я. Спробуй ще раз.", reply_markup=main_menu()); return
+    ensure_client(name)
+    CURRENT_CLIENT[reply_msg.from_user.id] = name
+    try:
+        tid = ensure_topic_for_client(name, THREADS[name].get("project"))
+        link = topic_link(GROUP_CHAT_ID, tid)
+        kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🧵 Відкрити тему", url=link))
+        bot.reply_to(reply_msg, f"🆕 Створив клієнта *{name}*. Кинь перше повідомлення.", reply_markup=main_menu())
+        bot.send_message(reply_msg.chat.id, "Швидкий перехід:", reply_markup=kb)
+    except Exception as e:
+        bot.reply_to(reply_msg, f"⚠️ Не вдалось створити тему: {e}", reply_markup=main_menu())
 
 # ========= CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
@@ -347,12 +268,13 @@ def cb(q):
     data = (q.data or "").split("|")
     action = data[0]
 
+    # ----- warm -----
     if action == "choose_client":
         client = data[1]
         ensure_client(client)
         CURRENT_CLIENT[q.from_user.id] = client
-        bot.edit_message_text(f"✅ Обрано клієнта: *{client}*. Надішли повідомлення — додам в історію.",
-                              q.message.chat.id, q.message.id)
+        bot.edit_message_text(f"✅ Обрано клієнта: *{md2_escape(client)}*. Надішли повідомлення — додам в історію.",
+                              q.message.chat.id, q.message.id, parse_mode="MarkdownV2")
         bot.answer_callback_query(q.id); return
 
     if action == "enter_client":
@@ -374,13 +296,13 @@ def cb(q):
         kb = types.InlineKeyboardMarkup(row_width=2)
         for p in PROFILES:
             kb.add(types.InlineKeyboardButton(p, callback_data=f"setprofile|{client}|{p}"))
-        bot.send_message(q.message.chat.id, f"Для *{client}*: вибери профіль:", reply_markup=kb)
+        bot.send_message(q.message.chat.id, f"Для *{md2_escape(client)}*: вибери профіль:", reply_markup=kb, parse_mode="MarkdownV2")
         bot.answer_callback_query(q.id); return
 
     if action == "setprofile":
         _, client, prof = data
         ensure_client(client); THREADS[client]["profile"] = prof
-        bot.send_message(q.message.chat.id, f"✅ Профіль *{prof}* встановлено для *{client}*  #профіль_{prof}")
+        bot.send_message(q.message.chat.id, f"✅ Профіль *{md2_escape(prof)}* встановлено для *{md2_escape(client)}*", parse_mode="MarkdownV2")
         bot.answer_callback_query(q.id); return
 
     if action == "to_designer":
@@ -391,7 +313,7 @@ def cb(q):
         kb = types.InlineKeyboardMarkup(row_width=1)
         for name in DESIGNERS.keys():
             kb.add(types.InlineKeyboardButton(name, callback_data=f"send_to|{client}|{name}"))
-        bot.send_message(q.message.chat.id, f"Кому надіслати тред *{client}*?", reply_markup=kb)
+        bot.send_message(q.message.chat.id, f"Кому надіслати тред *{md2_escape(client)}*?", reply_markup=kb, parse_mode="MarkdownV2")
         bot.answer_callback_query(q.id); return
 
     if action == "send_to":
@@ -402,7 +324,7 @@ def cb(q):
         if chat_id:
             PROJECTS_BY_DESIGNER.setdefault(designer, []).append(f"{client}: {last_msg}")
             bot.send_message(chat_id, f"🧾 {md2_escape(client)}\n\n{md2_escape(last_msg)}", parse_mode="MarkdownV2")
-            bot.send_message(q.message.chat.id, f"✅ Надіслано *{designer}*  #дизайнер_{designer}")
+            bot.send_message(q.message.chat.id, f"✅ Надіслано *{md2_escape(designer)}*", parse_mode="MarkdownV2")
         else:
             bot.send_message(q.message.chat.id, f"⚠️ Для '{designer}' немає Telegram ID у ENV DESIGNERS.")
         bot.answer_callback_query(q.id); return
@@ -412,7 +334,7 @@ def cb(q):
         info = THREADS.get(client, {})
         last_file = info.get("last_file_sent")
         if last_file and datetime.utcnow() - last_file > timedelta(hours=24):
-            bot.send_message(q.message.chat.id, f"🔔 24 години минули: нагадай клієнту *{client}*.")
+            bot.send_message(q.message.chat.id, f"🔔 24 години минули: нагадай клієнту *{md2_escape(client)}*.", parse_mode="MarkdownV2")
         else:
             bot.send_message(q.message.chat.id, "🕓 Ще не минуло 24 год або файл не відправлявся.")
         bot.answer_callback_query(q.id); return
@@ -421,16 +343,45 @@ def cb(q):
         client = data[1]
         if client in THREADS:
             THREADS[client]["status"] = "closed"
-            bot.send_message(q.message.chat.id, f"✅ Тред *{client}* закрито.")
+            bot.send_message(q.message.chat.id, f"✅ Тред *{md2_escape(client)}* закрито.", parse_mode="MarkdownV2")
         bot.answer_callback_query(q.id); return
 
-    # ---- COLD (крок 1) ----
+    # ----- COLD -----
     if action == "cold_setprof":
-        _, prof, topic_id = data
-        bot.edit_message_text(f"Профіль обрано: *{prof}*. Далі згенеруємо пітч і перевірку ціни у кроці 2.",
-                              q.message.chat.id, q.message.id)
+        _, lead_id, prof = data
+        lead_id = int(lead_id)
+        lead = LEADS.get(lead_id)
+        if not lead:
+            bot.answer_callback_query(q.id, "Лід не знайдено."); return
+        lead["profile"] = prof
+        bot.edit_message_text(f"Лід id={lead_id}. Профіль: *{md2_escape(prof)}*.\nГотово до створення проєкту.",
+                              q.message.chat.id, q.message.id, parse_mode="MarkdownV2")
+        bot.answer_callback_query(q.id); return
+
+    if action == "cold_convert":
+        _, lead_id = data
+        lead_id = int(lead_id)
+        lead = LEADS.get(lead_id)
+        if not lead:
+            bot.answer_callback_query(q.id, "Лід не знайдено."); return
+
+        client = lead["client"] if lead["client"] != "(без імені)" else f"Lead {lead_id}"
+        tid = ensure_topic_for_client(client)
+        summary = (
+            f"*Lead → Project*\n"
+            f"• ID: `{lead_id}`\n"
+            f"• Client: *{md2_escape(client)}*\n"
+            f"• Profile: *{md2_escape(lead.get('profile') or '—')}*\n"
+            f"• Created: `{lead['created_ts']}`\n\n"
+            f"{md2_escape(lead['text'])}"
+        )
+        bot.send_message(GROUP_CHAT_ID, summary, message_thread_id=tid, parse_mode="MarkdownV2")
+
+        lead["status"] = "archived"
+        link = topic_link(GROUP_CHAT_ID, tid)
+        bot.edit_message_text(f"✅ Проєкт‑тред створено: {link}", q.message.chat.id, q.message.id, disable_web_page_preview=True)
         bot.answer_callback_query(q.id); return
 
 # ========= RUN =========
-print(f"Bot is starting… GROUP_CHAT_ID={GROUP_CHAT_ID} COLD_GROUP_ID={COLD_GROUP_ID} COLD_INBOX_TOPIC={COLD_INBOX_TOPIC}")
+print(f"Bot is starting… GROUP_CHAT_ID={GROUP_CHAT_ID} COLD_INBOX_TOPIC={COLD_INBOX_TOPIC}")
 bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
